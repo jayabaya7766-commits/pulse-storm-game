@@ -1,15 +1,13 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Pulse Orchard — boot and the one loop. Input is read every frame; the world advances in fixed
+// 1/60 s steps (several in a slow frame, none in a fast one) and the renderer paints what is there.
+// The game moves between five screens: title, play, paused, game over and win. ?seed=N fixes the
+// pattern; ?shot=start|play|win|over stages that scene for a screenshot and sets window.__shotReady.
+import { BEST_KEY, FIELD, STEP } from './config.js';
+import { createAudio } from './audio.js';
+import { ACTION_CONFIRM, ACTION_MUTE, ACTION_PAUSE, createInput } from './input.js';
+import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
 import { stageShot } from './shots.js';
+import { createWorld, EVENT_CLEAR, EVENT_MATCH, EVENT_OVER, EVENT_STAR, EVENT_WIN, EVENT_WRONG } from './world.js';
 
 /** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
@@ -21,8 +19,9 @@ const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() 
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const world = createWorld(seed);
 const renderer = createRenderer(canvas);
+const audio = createAudio();
 
 function readBest() {
   try {
@@ -44,7 +43,7 @@ function runShot(name) {
   const scene = stageShot(name, world);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(world.state, scene.screen, scene.best, world.cells);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -58,8 +57,8 @@ function runGame() {
   let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  let unlocked = false;
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
   function announce(message) {
     status.textContent = message;
   }
@@ -68,22 +67,37 @@ function runGame() {
     world.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    announce(`Playing. ${world.state.lives} lives.`);
   }
 
-  function endGame() {
-    screen = SCREEN_OVER;
+  function endGame(won) {
+    screen = won ? SCREEN_WIN : SCREEN_OVER;
     if (world.state.score > best) {
       best = world.state.score;
       saveBest(best);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+    announce(won ? `You saved the orchard! Score ${world.state.score}.` : `Game over. Score ${world.state.score}. Best ${best}.`);
+  }
+
+  function react(events) {
+    if (events & EVENT_MATCH) audio.bloom(world.state.combo);
+    if (events & EVENT_STAR) audio.star();
+    if (events & EVENT_WRONG) audio.wrong();
+    if (events & EVENT_CLEAR) audio.wave();
+    if (events & EVENT_OVER) { audio.over(); endGame(false); }
+    else if (events & EVENT_WIN) { audio.win(); endGame(true); }
   }
 
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
+    if (actions & ACTION_MUTE) {
+      audio.setMuted(!audio.isMuted());
+      announce(audio.isMuted() ? 'Muted.' : 'Sound on.');
+    }
+    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_WIN)) {
+      audio.ui();
+      startGame();
+    } else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
       announce('Paused.');
     } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
@@ -92,14 +106,19 @@ function runGame() {
     }
   }
 
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
+  function aimX() {
+    const pointer = input.pointer();
+    if (pointer.x !== null) {
+      const rect = canvas.getBoundingClientRect();
+      const scale = rect.width / FIELD.width;
+      return (pointer.x - rect.left) / scale;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    return world.state.aimX + input.direction() * 14;
+  }
+
+  function step() {
+    const events = world.step(STEP, aimX(), input.fireHeld());
+    react(events);
   }
 
   function frame(now) {
@@ -107,18 +126,29 @@ function runGame() {
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
     handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
+    if (screen === SCREEN_TITLE) {
+      world.step(STEP, FIELD.width / 2, false); // ambient blossoms drift on the title
+    } else if (screen === SCREEN_PLAY) {
+      while (accumulator >= STEP) {
         step();
         accumulator -= STEP;
+        if (screen !== SCREEN_PLAY) break;
       }
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(world.state, screen, best, world.cells);
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
+  // The first gesture unlocks audio, as browsers require, and starts music.
+  function unlock() {
+    if (unlocked) return;
+    unlocked = true;
+    audio.unlock();
+  }
+  canvas.addEventListener('pointerdown', unlock);
+  window.addEventListener('keydown', unlock);
+
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -126,7 +156,7 @@ function runGame() {
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Pulse Orchard. Zap the blossoms of the pulse colour before they root.');
   requestAnimationFrame(frame);
 }
 
